@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 DB_PATH = os.environ.get("DB_PATH", "blc.db")
 HISTORY_LIMIT = 10
 NOTIFY_AFTER = 15
-DEFAULT_DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "100"))
+DEFAULT_DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "400"))
 
 # Если папка для БД ещё не существует (например, Volume в Railway не смонтирован
 # или DB_PATH указывает на вложенный путь) — создаём её, чтобы не падать с
@@ -213,7 +213,36 @@ def tg_broadcast_failed_count() -> int:
         ).fetchone()[0]
 
 
-# ─── ПОИСК TELEGRAM-ПРОФИЛЕЙ ПО НОМЕРУ ───────────────────────────
+# ─── ПОИСК TELEGRAM-ПРОФИЛЕЙ ПО НОМЕРУ (дневной лимит) ───────────
+def get_findtg_daily_limit() -> int:
+    return int(_get_state("findtg_daily_limit", "400"))
+
+
+def set_findtg_daily_limit(n: int):
+    _set_state("findtg_daily_limit", str(n))
+
+
+def get_findtg_checked_today() -> int:
+    today = datetime.now().strftime("%Y-%m-%d")
+    last_date = _get_state("findtg_last_date", "")
+    if last_date != today:
+        _set_state("findtg_checked_today", "0")
+        _set_state("findtg_last_date", today)
+        return 0
+    return int(_get_state("findtg_checked_today", "0"))
+
+
+def register_findtg_checked(n: int = 1):
+    today = datetime.now().strftime("%Y-%m-%d")
+    count = get_findtg_checked_today()
+    _set_state("findtg_checked_today", str(count + n))
+    _set_state("findtg_last_date", today)
+
+
+def findtg_remaining_today() -> int:
+    return max(0, get_findtg_daily_limit() - get_findtg_checked_today())
+
+
 def get_unchecked_clients(limit: int) -> list:
     """Следующая пачка номеров, которые ещё не проверялись на наличие Telegram."""
     with get_conn() as conn:
