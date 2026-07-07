@@ -16,6 +16,8 @@
 """
 import asyncio
 import os
+import random
+from datetime import datetime, timedelta
 
 from telethon.tl.functions.contacts import ImportContactsRequest, DeleteContactsRequest
 from telethon.tl.types import InputPhoneContact
@@ -27,6 +29,16 @@ import logger
 CHUNK_SIZE = 500  # лимит Telegram на ImportContactsRequest за один запрос
 PAUSE_BETWEEN_CHUNKS = float(os.environ.get("FINDTG_PAUSE_SECONDS", "3"))
 REPORT_EVERY = 20  # шлём накопленные находки в чат раз в столько штук, чтобы не спамить
+
+# ─── Автономный режим с дневным лимитом ──────────────────────────
+# Telegram сам по факту ограничивает, сколько номеров в день можно
+# резолвить через ImportContactsRequest (антискрейпинг-защита) —
+# крупная пачка за один раз тихо вернёт "не найдено" даже для
+# реальных аккаунтов. Поэтому вместо одного большого прогона бот сам,
+# в фоне, без команд, проверяет по чуть-чуть каждый день и размазывает
+# эти проверки по всему дню, а не делает их одним залпом.
+AUTO_ENABLED = os.environ.get("FINDTG_AUTO_ENABLED", "1") == "1"
+_auto_running = [False]
 
 _running = [False]
 _task = [None]
@@ -156,3 +168,113 @@ async def _flush_buffer(client, target_chat_id, buffer):
     for i in range(0, len(text), 3500):
         await client.send_message(target_chat_id, text[i:i + 3500])
         await asyncio.sleep(1)
+
+
+async def _check_one(client, target_chat_id, phone: str) -> bool:
+    """Проверяет ровно один номер (без пачек по 500) — так поведение ближе
+    к обычному ручному поиску, а не к массовому скану."""
+    contact = InputPhoneContact(client_id=0, phone=phone, first_name="Client", last_name="")
+    try:
+        result = await client(ImportContactsRequest([contact]))
+    except FloodWaitError as e:
+        await asyncio.sleep(e.seconds + 1)
+        try:
+            result = await client(ImportContactsRequest([contact]))
+        except Exception as e2:
+            await logger.error(e2, f"auto findtg check {phone} (retry)")
+            return False
+    except Exception as e:
+        await logger.error(e, f"auto findtg check {phone}")
+        return False
+
+    has_tg = bool(result.imported)
+    username = None
+    user_id = None
+    if has_tg:
+        user_id = result.imported[0].user_id
+        u = result.users[0] if result.users else None
+        username = u.username if u else None
+        name = " ".join(filter(None, [u.first_name, u.last_name])) if u else ""
+        tag = f"@{username}" if username else f"id{user_id}"
+        line = f"📱 +{phone} → {tag}"
+        if name:
+            line += f" ({name})"
+        await client.send_message(target_chat_id, line)
+        # Убираем временный контакт сразу — не нужно копить их в адресной книге
+        try:
+            await client(DeleteContactsRequest(id=[user_id]))
+        except Exception as e:
+            await logger.error(e, "auto findtg cleanup contact")
+
+    storage.mark_tg_checked(phone, has_tg, user_id, username)
+    storage.register_findtg_checked(1)
+    return has_tg
+
+
+def _seconds_until_next_midnight() -> float:
+    now = datetime.now()
+    tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=5, microsecond=0)
+    return (tomorrow - now).total_seconds()
+
+
+async def auto_loop(client, target_chat_id, admin_id: int):
+    """Фоновая задача: сама, без команд, проверяет номера каждый день —
+    не больше storage.get_findtg_daily_limit() штук в сутки, размазывая
+    проверки равномерно по дню (а не одним залпом), пока не закончится
+    вся база. Переживает рестарт бота — прогресс и дневной счётчик лежат
+    в БД, а не в памяти."""
+    _auto_running[0] = True
+    await logger.tg(
+        f"🔍 Автопоиск TG-профилей включён. Лимит: {storage.get_findtg_daily_limit()}/день.",
+        "info"
+    )
+
+    while _auto_running[0]:
+        remaining_today = storage.findtg_remaining_today()
+
+        if remaining_today <= 0:
+            # Лимит на сегодня исчерпан — ждём до полуночи и обнуляем счётчик
+            await asyncio.sleep(_seconds_until_next_midnight())
+            continue
+
+        batch = storage.get_unchecked_clients(remaining_today)
+        if not batch:
+            # Все номера в базе уже проверены — ждём сутки и на всякий случай
+            # проверяем снова (вдруг добавили новые номера в базу)
+            await logger.tg("✅ Все номера в базе проверены. Автопоиск засыпает на сутки.", "info")
+            await asyncio.sleep(_seconds_until_next_midnight())
+            continue
+
+        # Растягиваем оставшиеся на сегодня проверки равномерно по разумному
+        # окну дня (не глубокой ночью), со случайным разбросом между ними —
+        # выглядит как обычная разовая активность, а не как бот-скрипт.
+        window_seconds = 14 * 3600  # ~14 часов активного окна в сутках
+        base_gap = window_seconds / max(1, len(batch))
+
+        for phone in batch:
+            if not _auto_running[0]:
+                break
+            if storage.findtg_remaining_today() <= 0:
+                break
+            await _check_one(client, target_chat_id, phone)
+            gap = random.uniform(base_gap * 0.5, base_gap * 1.5)
+            await asyncio.sleep(gap)
+
+        status = get_status()
+        await logger.tg(
+            f"🔍 Автопоиск: сегодня проверено {storage.get_findtg_checked_today()}/"
+            f"{storage.get_findtg_daily_limit()}. Всего по базе: "
+            f"{status['checked']}/{status['total']}, найдено: {status['found']}",
+            "info"
+        )
+        await asyncio.sleep(_seconds_until_next_midnight())
+
+    _auto_running[0] = False
+
+
+def stop_auto():
+    _auto_running[0] = False
+
+
+def is_auto_running() -> bool:
+    return _auto_running[0]
