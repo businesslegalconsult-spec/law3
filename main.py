@@ -358,8 +358,26 @@ async def handle_admin(event):
             f"Проверено: {s['checked']}\n"
             f"Найдено с Telegram: {s['found']}\n"
             f"Осталось проверить: {s['remaining']}\n"
-            f"Статус: {'идёт поиск' if fc.is_running() else 'остановлен'}"
+            f"Ручной запуск: {'идёт' if fc.is_running() else 'остановлен'}\n"
+            f"Автопоиск (дневной лимит): {'включён' if fc.is_auto_running() else 'выключен'}\n"
+            f"Лимит/день: {storage.get_findtg_daily_limit()}\n"
+            f"Проверено сегодня: {storage.get_findtg_checked_today()}/{storage.get_findtg_daily_limit()}"
         )
+
+    elif text.startswith("/findtglimit"):
+        parts = text.split()
+        if len(parts) == 2 and parts[1].isdigit():
+            storage.set_findtg_daily_limit(int(parts[1]))
+            await event.respond(f"✅ Дневной лимит автопоиска установлен: {parts[1]}/день")
+        else:
+            await event.respond(
+                f"Текущий лимит: {storage.get_findtg_daily_limit()}/день\n"
+                f"Формат: /findtglimit 10"
+            )
+
+    elif text.startswith("/stopautofindtg"):
+        fc.stop_auto()
+        await event.respond("🛑 Автопоиск остановлен (можно снова включить рестартом бота).")
 
     elif text.startswith("/help"):
         await event.respond(
@@ -372,9 +390,11 @@ async def handle_admin(event):
             "/mailbroadcast [лимит/день] — рассылка на почту (продолжает с места остановки)\n"
             "/stopmailbroadcast — остановить почтовую рассылку\n"
             "/mailstatus — прогресс почтовой рассылки\n"
-            "/findtg [N] — искать клиентов с Telegram-профилем по номеру (резюмируемо)\n"
-            "/stopfindtg — остановить поиск\n"
-            "/findtgstatus — сколько проверено / найдено\n"
+            "/findtg [N] — ручной разовый поиск (для теста небольшой пачкой)\n"
+            "/stopfindtg — остановить ручной поиск\n"
+            "/findtgstatus — сколько проверено / найдено, статус автопоиска\n"
+            "/findtglimit [N] — задать дневной лимит автопоиска (по умолчанию 10)\n"
+            "/stopautofindtg — остановить фоновый автопоиск\n"
             "/help — эта справка"
         )
 
@@ -388,6 +408,8 @@ async def main():
     await import_known_contacts()
     asyncio.create_task(watchdog.run(client))
     asyncio.create_task(analytics.weekly_report_loop(client, REPORT_CHAT_ID))
+    if fc.AUTO_ENABLED:
+        asyncio.create_task(fc.auto_loop(client, FOUND_TG_CHAT_ID, ADMIN_ID))
     # Почтовая рассылка автоматически продолжает с того места, где остановилась
     # (прогресс хранится в БД, а не в памяти) — можно просто раскомментировать,
     # если нужно чтобы она стартовала сама при поднятии бота:
